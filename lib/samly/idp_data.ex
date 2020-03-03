@@ -15,6 +15,7 @@ defmodule Samly.IdpData do
             base_url: nil,
             metadata_file: nil,
             pre_session_create_pipeline: nil,
+            pre_logout_pipeline: nil,
             use_redirect_for_req: false,
             sign_requests: true,
             sign_metadata: true,
@@ -41,6 +42,7 @@ defmodule Samly.IdpData do
           base_url: nil | binary(),
           metadata_file: nil | binary(),
           pre_session_create_pipeline: nil | module(),
+          pre_logout_pipeline: nil | module(),
           use_redirect_for_req: boolean(),
           sign_requests: boolean(),
           sign_metadata: boolean(),
@@ -73,15 +75,21 @@ defmodule Samly.IdpData do
   @post "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
 
   @entity_id_selector ~x"//#{@entdesc}/@entityID"sl
-  @nameid_format_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@nameid}/text()"s
   @req_signed_selector ~x"//#{@entdesc}/#{@idpdesc}/@#{@signedreq}"s
-  @sso_redirect_url_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@ssos}[@Binding = '#{@redirect}']/@Location"s
-  @sso_post_url_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@ssos}[@Binding = '#{@post}']/@Location"s
-  @slo_redirect_url_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@slos}[@Binding = '#{@redirect}']/@Location"s
-  @slo_post_url_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@slos}[@Binding = '#{@post}']/@Location"s
   @signing_keys_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@keydesc}[@use != 'encryption']"l
   @enc_keys_selector ~x"//#{@entdesc}/#{@idpdesc}/#{@keydesc}[@use = 'encryption']"l
+
+  # These functions work on EntityDescriptor element
+  @sso_redirect_url_selector ~x"/#{@entdesc}/#{@idpdesc}/#{@ssos}[@Binding = '#{@redirect}']/@Location"s
+  @sso_post_url_selector ~x"/#{@entdesc}/#{@idpdesc}/#{@ssos}[@Binding = '#{@post}']/@Location"s
+  @slo_redirect_url_selector ~x"/#{@entdesc}/#{@idpdesc}/#{@slos}[@Binding = '#{@redirect}']/@Location"s
+  @slo_post_url_selector ~x"/#{@entdesc}/#{@idpdesc}/#{@slos}[@Binding = '#{@post}']/@Location"s
+  # TODO How to deal with multiple nameid formats?
+  @nameid_format_selector ~x"/#{@entdesc}/#{@idpdesc}/#{@nameid}/text()[1]"s
+  @signing_keys_in_idp_selector ~x"./#{@idpdesc}/#{@keydesc}[@use != 'encryption']"l
   @cert_selector ~x"./ds:KeyInfo/ds:X509Data/ds:X509Certificate/text()"s
+
+  defp entity_by_id_selector(id), do: ~x"/#{@entsdesc}/#{@entdesc}[@entityID = '#{id}'][1]"
 
   @type id :: binary()
 
@@ -110,9 +118,10 @@ defmodule Samly.IdpData do
        when is_binary(id) and is_binary(sp_id) do
     %IdpData{idp_data | id: id, sp_id: sp_id, base_url: Map.get(opts_map, :base_url)}
     |> set_metadata_file(opts_map)
-    |> set_pipeline(opts_map)
+    |> set_pipelines(opts_map)
     |> set_allowed_target_urls(opts_map)
     |> set_boolean_attr(opts_map, :use_redirect_for_req)
+    |> set_boolean_attr(opts_map, :use_redirect_for_logout_req)
     |> set_boolean_attr(opts_map, :sign_requests)
     |> set_boolean_attr(opts_map, :sign_metadata)
     |> set_boolean_attr(opts_map, :signed_assertion_in_resp)
@@ -121,9 +130,9 @@ defmodule Samly.IdpData do
   end
 
   @spec load_metadata(%IdpData{}, map()) :: %IdpData{}
-  defp load_metadata(idp_data, _opts_map) do
+  defp load_metadata(idp_data, opts_map) do
     with {:reading, {:ok, raw_xml}} <- {:reading, File.read(idp_data.metadata_file)},
-         {:parsing, {:ok, idp_data}} <- {:parsing, from_xml(raw_xml, idp_data)} do
+         {:parsing, {:ok, idp_data}} <- {:parsing, from_xml(raw_xml, idp_data, opts_map)} do
       idp_data
     else
       {:reading, {:error, reason}} ->
@@ -187,10 +196,16 @@ defmodule Samly.IdpData do
     %IdpData{idp_data | metadata_file: Map.get(opts_map, :metadata_file, @default_metadata_file)}
   end
 
-  @spec set_pipeline(%IdpData{}, map()) :: %IdpData{}
-  defp set_pipeline(%IdpData{} = idp_data, %{} = opts_map) do
+  @spec set_pipelines(%IdpData{}, map()) :: %IdpData{}
+  defp set_pipelines(%IdpData{} = idp_data, %{} = opts_map) do
     pipeline = Map.get(opts_map, :pre_session_create_pipeline)
-    %IdpData{idp_data | pre_session_create_pipeline: pipeline}
+    logout_pipeline = Map.get(opts_map, :pre_logout_pipeline)
+
+    %IdpData{
+      idp_data
+      | pre_session_create_pipeline: pipeline,
+        pre_logout_pipeline: logout_pipeline
+    }
   end
 
   defp set_allowed_target_urls(%IdpData{} = idp_data, %{} = opts_map) do
@@ -251,8 +266,8 @@ defmodule Samly.IdpData do
     if is_boolean(v), do: Map.put(idp_data, attr_name, v), else: idp_data
   end
 
-  @spec from_xml(binary, %IdpData{}) :: {:ok, %IdpData{}}
-  def from_xml(metadata_xml, idp_data) when is_binary(metadata_xml) do
+  @spec from_xml(binary, %IdpData{}, %{}) :: {:ok, %IdpData{}}
+  def from_xml(metadata_xml, idp_data, opts) when is_binary(metadata_xml) do
     xml_opts = [
       space: :normalize,
       namespace_conformant: true,
@@ -261,22 +276,48 @@ defmodule Samly.IdpData do
     ]
 
     md_xml = SweetXml.parse(metadata_xml, xml_opts)
-    signing_certs = get_signing_certs(md_xml)
 
-    {:ok,
-     %IdpData{
-       idp_data
-       | entity_id: get_entity_id(md_xml),
-         signed_requests: get_req_signed(md_xml),
-         certs: signing_certs,
-         fingerprints: idp_cert_fingerprints(signing_certs),
-         sso_redirect_url: get_sso_redirect_url(md_xml),
-         sso_post_url: get_sso_post_url(md_xml),
-         slo_redirect_url: get_slo_redirect_url(md_xml),
-         slo_post_url: get_slo_post_url(md_xml),
-         nameid_format: get_nameid_format(md_xml)
-     }}
+    entityID =
+      case federation_metadata?(opts) do
+        false -> get_entity_id(md_xml)
+        true -> opts[:entity_id]
+      end
+
+    entity_md_xml = get_entity_descriptor(md_xml, entityID)
+
+    case entity_md_xml do
+      nil ->
+        Logger.warn("[Samly] Entity #{inspect(entityID)} not found")
+        {:ok, idp_data}
+
+      {:error, :entity_not_found} = err ->
+        Logger.warn("[Samly] Entity not found due to configuration error")
+        {:ok, idp_data}
+
+      {:error, reason} ->
+        Logger.warn("[Samly] Parsing error due to: #{inspect(reason)}")
+        {:ok, idp_data}
+
+      _ ->
+        signing_certs = get_signing_certs_in_idp(entity_md_xml)
+
+        {:ok,
+         %IdpData{
+           idp_data
+           | entity_id: entityID,
+             signed_requests: get_req_signed(md_xml),
+             certs: signing_certs,
+             fingerprints: idp_cert_fingerprints(signing_certs),
+             sso_redirect_url: get_sso_redirect_url(entity_md_xml),
+             sso_post_url: get_sso_post_url(entity_md_xml),
+             slo_redirect_url: get_slo_redirect_url(entity_md_xml),
+             slo_post_url: get_slo_post_url(entity_md_xml),
+             nameid_format: get_nameid_format(entity_md_xml)
+         }}
+    end
   end
+
+  defp federation_metadata?(opts), do: opts[:entity_id] != nil
 
   # @spec to_esaml_idp_metadata(IdpData.t(), map()) :: :esaml_idp_metadata
   defp to_esaml_idp_metadata(%IdpData{} = idp_data, %{} = idp_config) do
@@ -373,11 +414,10 @@ defmodule Samly.IdpData do
   @spec get_req_signed(:xmlElement) :: binary()
   def get_req_signed(md_elem), do: get_data(md_elem, @req_signed_selector)
 
-  @spec get_signing_certs(:xmlElement) :: certs()
-  def get_signing_certs(md_elem), do: get_certs(md_elem, @signing_keys_selector)
+  # @spec get_signing_certs(:xmlElement) :: certs()
+  # def get_signing_certs(md_elem), do: get_certs(md_elem, signing_keys_selector())
 
-  @spec get_enc_certs(:xmlElement) :: certs()
-  def get_enc_certs(md_elem), do: get_certs(md_elem, @enc_keys_selector)
+  def get_signing_certs_in_idp(md_elem), do: get_certs(md_elem, @signing_keys_in_idp_selector)
 
   @spec get_certs(:xmlElement, %SweetXpath{}) :: certs()
   defp get_certs(md_elem, key_selector) do
@@ -424,5 +464,16 @@ defmodule Samly.IdpData do
     xpath
     |> SweetXml.add_namespace("md", "urn:oasis:names:tc:SAML:2.0:metadata")
     |> SweetXml.add_namespace("ds", "http://www.w3.org/2000/09/xmldsig#")
+  end
+
+  @spec get_entity_descriptor(:xmlElement, entityID :: binary()) :: :xmlElement | nil
+  defp get_entity_descriptor(md_xml, entityID) do
+    selector = entity_by_id_selector(entityID) |> add_ns()
+
+    try do
+      SweetXml.xpath(md_xml, selector)
+    rescue
+      _ -> {:error, :entity_not_found}
+    end
   end
 end
